@@ -1,29 +1,23 @@
-version: '3.8'
-
 services:
-  # The UI we just built
-  nexamiro-web:
+  nexamiro:
     build: .
     ports:
-      - "3000:80"
-    restart: unless-stopped
-    depends_on:
-      - vector-db
-
-  # Placeholder for the future Node.js / Python API Gateway
-  nexamiro-api:
-    image: node:20-alpine
-    command: echo "API Gateway coming soon..."
-    ports:
-      - "8080:8080"
-    
-  # Enterprise Vector Database for your RAG Pipeline
-  vector-db:
-    image: qdrant/qdrant:latest
-    ports:
-      - "6333:6333"
+      - '127.0.0.1:3000:8080'
+    environment:
+      ACCESS_TOKEN: ${ACCESS_TOKEN:?Set ACCESS_TOKEN to a random value of at least 24 characters}
+      MODEL_BASE_URL: ${MODEL_BASE_URL:-}
+      MODEL_API_KEY: ${MODEL_API_KEY:-}
+      MODEL_GENERAL: ${MODEL_GENERAL:-}
+      MODEL_REASONING: ${MODEL_REASONING:-}
+      MODEL_CODING: ${MODEL_CODING:-}
+      MODEL_TIMEOUT_MS: ${MODEL_TIMEOUT_MS:-60000}
+      MODEL_MAX_TOKENS: ${MODEL_MAX_TOKENS:-1800}
+      MODEL_REASONING_ENABLED: ${MODEL_REASONING_ENABLED:-}
+      MODEL_PROVIDER_NAME: ${MODEL_PROVIDER_NAME:-}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
     volumes:
-      - qdrant_data:/qdrant/storage
+      - nexamiro_data:/app/data
+    restart: unless-stopped
 
 volumes:
-  qdrant_data:
+  nexamiro_data:
