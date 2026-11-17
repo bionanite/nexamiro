@@ -90,6 +90,11 @@ export function createGateway({ engine, env = process.env, staticDir = resolve(r
           return json(200, { ok: true });
         }
         if (req.method === 'GET' && path === '/api/status') return json(200, await engine.status());
+        if (req.method === 'POST' && path === '/api/models/test') {
+          const body = await readJson(req);
+          if (Object.keys(body).length !== 0) throw fail('The model connection test accepts only an empty JSON object.');
+          return json(200, await engine.testModels());
+        }
         if (req.method === 'GET' && path === '/api/tasks') return json(200, { tasks: await engine.listTasks() });
         if (req.method === 'POST' && path === '/api/tasks') return json(202, { task: await engine.createTask(await readJson(req)) });
         const taskMatch = path.match(/^\/api\/tasks\/([a-zA-Z0-9_-]+)(?:\/(cancel|retry))?$/);

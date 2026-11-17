@@ -7,9 +7,9 @@ import { Readable } from 'node:stream';
 import { createEngine } from '../backend/engine.js';
 import { createGateway } from '../backend/gateway.js';
 
-async function setup(t, env = {}) {
+async function setup(t, env = {}, engineOptions = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'nexamiro-http-'));
-  const engine = await createEngine({ dataDir: join(directory, 'data'), env: {}, demoDelayMs: 15 });
+  const engine = await createEngine({ dataDir: join(directory, 'data'), env: {}, demoDelayMs: 15, ...engineOptions });
   const staticDir = join(directory, 'dist');
   await mkdir(staticDir);
   await writeFile(join(staticDir, 'index.html'), '<html>Nexamiro</html>');
@@ -112,4 +112,42 @@ test('serves built frontend and denies API leakage into SPA fallback', async t =
   const unknown = await request('/api/nonexistent');
   assert.equal(unknown.status, 404);
   assert.match(unknown.headers.get('content-type'), /application\/json/);
+});
+
+test('model probe route requires auth, allowed origin, and an exact empty JSON object', async t => {
+  const token = 'test-workspace-access-token-at-least-24';
+  let calls = 0;
+  const { request, requestRaw } = await setup(t, { ACCESS_TOKEN: token }, {
+    env: { MODEL_BASE_URL: 'http://localhost:11434/v1', MODEL_GENERAL: 'shared-model' },
+    fetchImpl: async () => { calls++; return new Response('secret provider response', { status: 401 }); },
+  });
+  const auth = { Authorization: `Bearer ${token}` };
+  assert.equal((await request('/api/models/test', 'POST', {})).status, 401);
+  assert.equal((await request('/api/models/test', 'POST', {}, { ...auth, Origin: 'https://evil.example' })).status, 403);
+  for (const body of [{ model: 'custom' }, { url: 'https://evil.example' }, { prompt: 'custom' }, [], null]) {
+    assert.equal((await request('/api/models/test', 'POST', body, auth)).status, 400);
+  }
+  assert.equal((await request('/api/models/test', 'GET', undefined, auth)).status, 404);
+  assert.equal((await requestRaw('/api/models/test', { method: 'POST', headers: { ...auth, 'Content-Type': 'text/plain' }, body: '{}' })).status, 415);
+  assert.equal((await requestRaw('/api/models/test', { method: 'POST', headers: { ...auth, 'Content-Type': 'application/json' }, body: '{"__proto__":{}}' })).status, 400);
+  assert.equal(calls, 0);
+  const response = await request('/api/models/test', 'POST', {}, auth);
+  assert.equal(response.status, 200);
+  const report = await response.json();
+  assert.equal(report.ok, false);
+  assert.equal(report.results.length, 1);
+  assert.match(report.results[0].error, /HTTP 401/);
+  assert.doesNotMatch(JSON.stringify(report), /secret provider/);
+  assert.equal((await request('/api/models/test', 'POST', {}, auth)).status, 429);
+  assert.equal(calls, 1);
+});
+
+test('model probe returns a useful 400 in demo mode and accepts authenticated session cookies', async t => {
+  const token = 'test-workspace-access-token-at-least-24';
+  const { request } = await setup(t, { ACCESS_TOKEN: token });
+  const session = await request('/api/session', 'POST', { token });
+  const cookie = session.headers.get('set-cookie').split(';')[0];
+  const response = await request('/api/models/test', 'POST', {}, { Cookie: cookie });
+  assert.equal(response.status, 400);
+  assert.match((await response.json()).error, /Configure a model endpoint/);
 });

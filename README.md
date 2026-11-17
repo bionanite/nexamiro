@@ -38,6 +38,18 @@ Then open **http://127.0.0.1:8080**. Copy `.env.example` to `.env` to configure 
 
 ## Connect a live model
 
+For a guided Together AI setup, run this in an interactive terminal in the project folder:
+
+```sh
+npm run setup:model
+```
+
+Create your key in [Together's API keys settings](https://api.together.ai/settings/projects/~current/api-keys), then paste it at the hidden terminal prompt. The helper saves the key in the ignored local `.env` file with owner-only permissions; it never prints the key or makes a provider request. It preserves unrelated environment settings and sets all three agent roles to `Qwen/Qwen3.5-9B` with thinking disabled for the first test. Running setup again replaces those model settings. Do not paste your key into chat or commit it to GitHub.
+
+Restart the server, then open **Models & tools → Test model connection**. The test makes one small billable request per distinct configured model, capped at 128 output tokens and 15 seconds per model. It sends only a synthetic prompt, not your documents or run history. Results show per-model success, latency, reported token use and safe error messages. A successful check verifies a text response; it does not evaluate answer quality or guarantee future availability. No checks run automatically.
+
+For Ollama, vLLM or another compatible provider, configure the server manually:
+
 Configure the server's `.env`:
 
 ```dotenv
@@ -50,9 +62,11 @@ MODEL_REASONING=your-installed-reasoning-model
 MODEL_CODING=your-installed-coding-model
 MODEL_TIMEOUT_MS=60000
 MODEL_MAX_TOKENS=1800
+# Optional: only for providers/models supporting reasoning.enabled:
+# MODEL_REASONING_ENABLED=false
 ```
 
-Both `MODEL_BASE_URL` and `MODEL_GENERAL` are required to enable live mode. Replace the model placeholders with identifiers actually served by your endpoint, then restart Nexamiro. The status screen reports **configured**, not a verified connectivity check. The first real run will surface endpoint/model errors. Local Ollama's compatible API is documented [here](https://docs.ollama.com/api/openai-compatibility); any provider used must support text `POST /chat/completions` under the supplied base URL.
+Both `MODEL_BASE_URL` and `MODEL_GENERAL` are required to enable live mode. Replace the model placeholders with identifiers actually served by your endpoint, then restart Nexamiro. Configuration and connection-test results are shown separately; the latest test result resets after restarting. Live runs still surface endpoint/model errors. Local Ollama's compatible API is documented [here](https://docs.ollama.com/api/openai-compatibility); any provider used must support text `POST /chat/completions` under the supplied base URL. Together's [OpenAI compatibility](https://docs.together.ai/docs/inference/openai-compatibility) and [reasoning controls](https://docs.together.ai/docs/inference/chat/reasoning) describe its API contract.
 
 Nexamiro does not install or download models. A live task may make three paid provider calls. Prompt, selected document excerpts, and previous agent outputs are transmitted to your configured provider. Local storage alone does not imply that inference stays on your machine. No external actions, shell execution, email sending, or web browsing are available to these agents.
 

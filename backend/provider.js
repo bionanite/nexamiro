@@ -37,15 +37,17 @@ export function createProvider({ env = process.env, fetchImpl = fetch } = {}) {
   }
   const timeout = boundedInteger(env.MODEL_TIMEOUT_MS, 60_000, 100, 180_000);
   const maxTokens = boundedInteger(env.MODEL_MAX_TOKENS, 1800, 64, 8192);
+  const rawReasoning = (env.MODEL_REASONING_ENABLED || '').trim();
+  if (rawReasoning && !['true', 'false'].includes(rawReasoning)) {
+    throw new Error('MODEL_REASONING_ENABLED must be true, false, or unset.');
+  }
+  const reasoningEnabled = rawReasoning ? rawReasoning === 'true' : undefined;
   const apiKey = env.MODEL_API_KEY || '';
   const name = (env.MODEL_PROVIDER_NAME || (url ? 'OpenAI-compatible endpoint' : 'Local demo')).slice(0, 100);
 
-  return {
-    configured: Boolean(url),
-    info: { name, configured: Boolean(url), baseUrl: url?.toString().replace(/\/$/, '') || '', models },
-    async complete({ system, prompt, model, signal }) {
+  async function requestCompletion({ system, prompt, model, signal, requestTimeout, tokenLimit, responseLimit = MAX_RESPONSE_BYTES, textLimit = 20_000, probe = false }) {
       if (!url) throw new ProviderError('No model endpoint is configured.');
-      const deadline = AbortSignal.timeout(timeout);
+      const deadline = AbortSignal.timeout(requestTimeout);
       const combinedSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
       try {
         const response = await fetchImpl(new URL('chat/completions', url), {
@@ -58,7 +60,8 @@ export function createProvider({ env = process.env, fetchImpl = fetch } = {}) {
             model,
             messages: [{ role: 'system', content: system }, { role: 'user', content: prompt }],
             temperature: 0.3,
-            max_tokens: maxTokens,
+            max_tokens: tokenLimit,
+            ...(reasoningEnabled === undefined ? {} : { reasoning: { enabled: reasoningEnabled } }),
             stream: false,
           }),
           signal: combinedSignal,
@@ -78,7 +81,7 @@ export function createProvider({ env = process.env, fetchImpl = fetch } = {}) {
             const { done, value } = await reader.read();
             if (done) break;
             bytes += value.byteLength;
-            if (bytes > MAX_RESPONSE_BYTES) {
+            if (bytes > responseLimit) {
               await reader.cancel();
               throw new ProviderError('Model response exceeded the supported size.');
             }
@@ -89,11 +92,13 @@ export function createProvider({ env = process.env, fetchImpl = fetch } = {}) {
         try { result = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
         catch { throw new ProviderError('Model endpoint returned invalid JSON.'); }
         if (result.choices?.[0]?.finish_reason === 'length') {
-          throw new ProviderError('Model output reached its token limit before finishing. Try a smaller task or increase MODEL_MAX_TOKENS.');
+          throw new ProviderError(probe
+            ? 'The model responded but did not finish within the connection test token limit. This can occur with reasoning enabled; check the model configuration or try a normal task.'
+            : 'Model output reached its token limit before finishing. Try a smaller task or increase MODEL_MAX_TOKENS.');
         }
         const text = result.choices?.[0]?.message?.content;
         if (typeof text !== 'string' || !text.trim()) throw new ProviderError('Model endpoint returned no text answer.');
-        if (text.length > 20_000) throw new ProviderError('Model answer exceeded the supported size. Try a smaller task.');
+        if (text.length > textLimit) throw new ProviderError('Model answer exceeded the supported size. Try a smaller task.');
         const tokenCount = value => Number.isSafeInteger(value) && value >= 0 ? value : 0;
         return {
           text: text.trim(),
@@ -101,10 +106,33 @@ export function createProvider({ env = process.env, fetchImpl = fetch } = {}) {
         };
       } catch (error) {
         if (signal?.aborted) throw new DOMException('Task cancelled.', 'AbortError');
-        if (deadline.aborted) throw new ProviderError('Model request timed out. Try a smaller task or check your endpoint.');
+        if (deadline.aborted) throw new ProviderError(probe
+          ? 'Model connection test timed out. Check the endpoint and configured model.'
+          : 'Model request timed out. Try a smaller task or check your endpoint.');
         if (error instanceof ProviderError) throw error;
         throw new ProviderError('Cannot reach the model endpoint. Check its URL, credentials, and availability.');
       }
+  }
+
+  return {
+    configured: Boolean(url),
+    info: { name, configured: Boolean(url), baseUrl: url?.toString().replace(/\/$/, '') || '', models, reasoningEnabled: reasoningEnabled ?? null },
+    complete({ system, prompt, model, signal }) {
+      return requestCompletion({ system, prompt, model, signal, requestTimeout: timeout, tokenLimit: maxTokens });
+    },
+    async probe({ model, signal }) {
+      const response = await requestCompletion({
+        system: 'This is a connection test. Reply with exactly OK.',
+        prompt: 'Reply with OK',
+        model, signal,
+        requestTimeout: Math.min(timeout, 15_000),
+        tokenLimit: Math.min(maxTokens, 128),
+        responseLimit: 64 * 1024,
+        textLimit: 2000,
+        probe: true,
+      });
+      // Probe output is deliberately discarded; only safe metering is exposed.
+      return { usage: response.usage };
     },
   };
 }

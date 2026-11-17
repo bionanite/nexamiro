@@ -12,7 +12,8 @@
     "build": "vite build",
     "start": "node --env-file-if-exists=.env backend/gateway.js",
     "test": "node --test tests/*.test.js",
-    "mcp": "node --env-file-if-exists=.env backend/mcp-server.js"
+    "mcp": "node --env-file-if-exists=.env backend/mcp-server.js",
+    "setup:model": "node scripts/setup-model.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.2",

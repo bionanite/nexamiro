@@ -229,3 +229,133 @@ test('truncated and oversized provider answers fail explicitly instead of appear
   const oversized = createProvider({ env: liveEnv, fetchImpl: async () => completion('x'.repeat(20001)) });
   await assert.rejects(oversized.complete({ system: 'system', prompt: 'user', model: 'general' }), /exceeded the supported size/);
 });
+
+test('reasoning flag is validated and preserved for both completions and bounded probes', async () => {
+  for (const setting of [undefined, 'true', 'false']) {
+    const requests = [];
+    const provider = createProvider({ env: { ...liveEnv, ...(setting === undefined ? {} : { MODEL_REASONING_ENABLED: setting }) }, fetchImpl: async (_url, options) => {
+      requests.push(options);
+      return completion('OK');
+    } });
+    await provider.complete({ system: 'system', prompt: 'user task', model: 'general-model' });
+    const report = await provider.probe({ model: 'general-model' });
+    assert.deepEqual(report, { usage: { inputTokens: 12, outputTokens: 7 } });
+    for (const request of requests) {
+      const body = JSON.parse(request.body);
+      assert.equal(request.redirect, 'error');
+      if (setting === undefined) assert.equal(Object.hasOwn(body, 'reasoning'), false);
+      else assert.deepEqual(body.reasoning, { enabled: setting === 'true' });
+    }
+    const probeBody = JSON.parse(requests[1].body);
+    assert.equal(probeBody.max_tokens, 128);
+    assert.equal(probeBody.messages[1].content, 'Reply with OK');
+    assert.equal(provider.info.reasoningEnabled, setting === undefined ? null : setting === 'true');
+  }
+  assert.throws(() => createProvider({ env: { ...liveEnv, MODEL_REASONING_ENABLED: 'yes' } }), /must be true, false, or unset/);
+});
+
+test('connection tests deduplicate models, use no workspace content, and keep reports in memory only', async t => {
+  const requests = [];
+  const { engine, dataDir } = await workspace(t, {
+    env: { ...liveEnv, MODEL_CODING: liveEnv.MODEL_GENERAL, MODEL_REASONING_ENABLED: 'false' },
+    fetchImpl: async (_url, options) => {
+      const body = JSON.parse(options.body);
+      requests.push(body);
+      return body.model === 'reasoning-model'
+        ? new Response('Internal error test-secret-never-echo', { status: 403 })
+        : completion('Provider output must stay private');
+    },
+  });
+  await engine.addDocument({ name: 'Private.txt', text: 'SENSITIVE-WORKSPACE-DOCUMENT-CONTENT' });
+  const snapshot = await readFile(join(dataDir, 'workspace.json'), 'utf8');
+  assert.equal(engine.status().provider.connection, null);
+  assert.equal(requests.length, 0);
+  const report = await engine.testModels();
+  assert.equal(report.ok, false);
+  assert.equal(report.results.length, 2);
+  assert.deepEqual(report.results[0].roles, ['general', 'coding']);
+  assert.deepEqual(report.results[1].roles, ['reasoning']);
+  assert.equal(report.results[0].ok, true);
+  assert.equal(report.results[1].ok, false);
+  assert.match(report.results[1].error, /HTTP 403/);
+  assert.ok(report.results.every(result => Number.isInteger(result.latencyMs) && result.latencyMs >= 0));
+  assert.doesNotMatch(JSON.stringify(report), /test-secret|Internal error|Provider output|SENSITIVE/);
+  assert.doesNotMatch(JSON.stringify(requests), /SENSITIVE-WORKSPACE/);
+  assert.deepEqual(engine.listTasks(), []);
+  assert.equal(await readFile(join(dataDir, 'workspace.json'), 'utf8'), snapshot);
+  assert.deepEqual(engine.status().provider.connection, report);
+  report.results[0].ok = false;
+  assert.equal(engine.status().provider.connection.results[0].ok, true);
+});
+
+test('connection test singleflight and completion cooldown prevent repeated model requests', async t => {
+  let currentTime = Date.parse('2026-11-17T12:00:00Z');
+  let calls = 0;
+  const resolveResponses = [];
+  const { engine } = await workspace(t, {
+    env: { MODEL_BASE_URL: liveEnv.MODEL_BASE_URL, MODEL_GENERAL: 'shared-model' },
+    clock: () => currentTime,
+    fetchImpl: async () => {
+      calls++;
+      if (calls === 1) return new Promise(resolve => resolveResponses.push(resolve));
+      return completion('OK');
+    },
+  });
+  const pending = engine.testModels();
+  await assert.rejects(engine.testModels(), { statusCode: 429 });
+  assert.equal(calls, 1);
+  resolveResponses[0](completion('OK'));
+  const first = await pending;
+  assert.equal(first.checkedAt, '2026-11-17T12:00:00.000Z');
+  await assert.rejects(engine.testModels(), { statusCode: 429 });
+  currentTime += 9999;
+  await assert.rejects(engine.testModels(), { statusCode: 429 });
+  currentTime++;
+  assert.equal((await engine.testModels()).ok, true);
+  assert.equal(calls, 2);
+});
+
+test('demo mode never probes and live probe timeouts return safe failures', async t => {
+  const { engine: demo } = await workspace(t, { fetchImpl: () => { throw new Error('Unexpected fetch'); } });
+  await assert.rejects(demo.testModels(), { statusCode: 400 });
+  assert.equal(demo.status().provider.connection, null);
+  const { engine: live } = await workspace(t, {
+    env: { MODEL_BASE_URL: liveEnv.MODEL_BASE_URL, MODEL_GENERAL: 'shared-model', MODEL_TIMEOUT_MS: '100' },
+    fetchImpl: async (_url, { signal }) => new Promise((_resolve, reject) => {
+      signal.addEventListener('abort', () => reject(new Error('SECRET network dump')), { once: true });
+    }),
+  });
+  // Keep the test event loop alive while AbortSignal.timeout's unref timer fires.
+  const hold = setInterval(() => {}, 1000);
+  t.after(() => clearInterval(hold));
+  const report = await live.testModels();
+  assert.equal(report.ok, false);
+  assert.match(report.results[0].error, /timed out/);
+  assert.doesNotMatch(JSON.stringify(report), /SECRET/);
+});
+
+test('probe enforces the 15-second maximum and response size without exposing rejected bodies', async t => {
+  const originalTimeout = AbortSignal.timeout;
+  const timeouts = [];
+  t.mock.method(AbortSignal, 'timeout', milliseconds => {
+    timeouts.push(milliseconds);
+    return originalTimeout.call(AbortSignal, milliseconds);
+  });
+  const provider = createProvider({ env: { ...liveEnv, MODEL_TIMEOUT_MS: '180000' }, fetchImpl: async () => completion('OK') });
+  await provider.probe({ model: 'general-model' });
+  assert.deepEqual(timeouts, [15000]);
+  const oversized = createProvider({ env: liveEnv, fetchImpl: async () => new Response('SENSITIVE'.repeat(10000)) });
+  await assert.rejects(oversized.probe({ model: 'general-model' }), error => /exceeded the supported size/.test(error.message) && !/SENSITIVE/.test(error.message));
+  const truncated = createProvider({ env: { ...liveEnv, MODEL_REASONING_ENABLED: 'true', MODEL_MAX_TOKENS: '8192' }, fetchImpl: async (_url, options) => {
+    const body = JSON.parse(options.body);
+    assert.equal(body.max_tokens, 128);
+    assert.deepEqual(body.reasoning, { enabled: true });
+    return new Response(JSON.stringify({ choices: [{ finish_reason: 'length', message: { content: 'incomplete' } }] }));
+  } });
+  await assert.rejects(truncated.probe({ model: 'general-model' }), error => /connection test token limit/.test(error.message) && !/increase MODEL_MAX_TOKENS/.test(error.message));
+  const redirect = createProvider({ env: liveEnv, fetchImpl: async (_url, options) => {
+    assert.equal(options.redirect, 'error');
+    throw new TypeError('Redirect blocked with test-secret-never-echo');
+  } });
+  await assert.rejects(redirect.probe({ model: 'general-model' }), error => /Cannot reach/.test(error.message) && !/test-secret/.test(error.message));
+});
